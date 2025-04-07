@@ -7,74 +7,62 @@ import * as events from "aws-cdk-lib/aws-lambda-event-sources";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
-
+import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // S3 Bucket
+    // 1. S3 Bucket
     const imagesBucket = new s3.Bucket(this, "images", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       publicReadAccess: false,
     });
 
-    // SNS Topic
+    // 2. SNS Topic
     const newImageTopic = new sns.Topic(this, "NewImageTopic", {
       displayName: "New Image topic",
     });
 
-    // S3 --> SNS
+    // 3. Add S3 --> SNS notification
     imagesBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SQS queue 1: imageProcessQueue
+    // 4. imageProcessQueue
     const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
     });
 
-    // SQS queue 2: imageBackupQueue
-    const imageBackupQueue = new sqs.Queue(this, "img-backup-queue", {
+    // 5. mailerQ
+    const mailerQ = new sqs.Queue(this, "mailer-queue", {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
     });
 
-    // SNS --> SQS (2 subscriptions)
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue)
-    );
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageBackupQueue)
-    );
+    // 6. Add both queues as SNS subscribers
+    newImageTopic.addSubscription(new subs.SqsSubscription(imageProcessQueue));
+    newImageTopic.addSubscription(new subs.SqsSubscription(mailerQ));
 
-    // Lambda: processImageFn
-    const processImageFn = new lambdanode.NodejsFunction(
-      this,
-      "ProcessImageFn",
-      {
-        runtime: lambda.Runtime.NODEJS_22_X,
-        entry: `${__dirname}/../lambdas/processImage.ts`,
-        timeout: cdk.Duration.seconds(15),
-        memorySize: 128,
-      }
-    );
+    // 7. Lambda: processImageFn
+    const processImageFn = new lambdanode.NodejsFunction(this, "ProcessImageFn", {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      entry: `${__dirname}/../lambdas/processImage.ts`,
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 128,
+    });
 
-    // Lambda: imageBackupFn
-    const imageBackupFn = new lambdanode.NodejsFunction(
-      this,
-      "ImageBackupFn",
-      {
-        runtime: lambda.Runtime.NODEJS_22_X,
-        entry: `${__dirname}/../lambdas/imageBackup.ts`,
-        timeout: cdk.Duration.seconds(15),
-        memorySize: 128,
-      }
-    );
+    // 8. Lambda: mailerFn
+    const mailerFn = new lambdanode.NodejsFunction(this, "mailer-function", {
+      runtime: lambda.Runtime.NODEJS_16_X,
+      memorySize: 1024,
+      timeout: cdk.Duration.seconds(3),
+      entry: `${__dirname}/../lambdas/mailer.ts`,
+    });
 
-    // SQS --> Lambda event source
+    // 9. Connect queues to lambdas
     processImageFn.addEventSource(
       new events.SqsEventSource(imageProcessQueue, {
         batchSize: 5,
@@ -82,23 +70,36 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    imageBackupFn.addEventSource(
-      new events.SqsEventSource(imageBackupQueue, {
+    mailerFn.addEventSource(
+      new events.SqsEventSource(mailerQ, {
         batchSize: 5,
         maxBatchingWindow: cdk.Duration.seconds(5),
       })
     );
 
-    // Grant permissions
+    // 10. Permissions
     imagesBucket.grantRead(processImageFn);
-    imagesBucket.grantRead(imageBackupFn);
+    imagesBucket.grantRead(mailerFn);
 
-    // Output
+    mailerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "ses:SendEmail",
+          "ses:SendRawEmail",
+          "ses:SendTemplatedEmail",
+        ],
+        resources: ["*"],
+      })
+    );
+
+    // 11. Output
     new cdk.CfnOutput(this, "bucketName", {
       value: imagesBucket.bucketName,
     });
   }
 }
+
 
 
 
